@@ -23,7 +23,7 @@ const {
   SERPER_API_KEY,
   CONCURRENCY = "1",
   TEST_LIMIT = "10",
-  MODEL_NAME = "llama3-8b"
+  MODEL_NAME = "llama3-8b",
 } = process.env;
 
 if (!MONGO_URL) {
@@ -53,15 +53,48 @@ function fullName(doc = {}) {
 
 function safeJSON(text) {
   if (!text) return null;
+
+  // First try direct parse
   try {
     return JSON.parse(text);
   } catch (err) {
-    // try extracting first {...}
+    // Try extracting JSON block
     const m = text.match(/{[\s\S]*}/);
     if (m) {
+      let extracted = m[0];
+
+      // Try parsing as-is first
       try {
-        return JSON.parse(m[0]);
-      } catch {}
+        return JSON.parse(extracted);
+      } catch {
+        // If that fails, fix common JSON issues:
+        // 1. Replace literal newlines inside strings with \n
+        // 2. Replace unescaped quotes
+        // 3. Remove control characters
+
+        try {
+          // Fix by properly escaping content within string values
+          extracted = extracted.replace(
+            /"(bio|strategy|insights)":\s*"([^"]*(?:"[^"]*)*?)"/gs,
+            (match, key, value) => {
+              // Escape control characters and newlines in the value
+              const cleaned = value
+                .replace(/\\/g, "\\\\") // Escape backslashes first
+                .replace(/\n/g, "\\n") // Escape newlines
+                .replace(/\r/g, "\\r") // Escape carriage returns
+                .replace(/\t/g, "\\t") // Escape tabs
+                .replace(/"/g, '\\"'); // Escape quotes
+              return `"${key}":"${cleaned}"`;
+            }
+          );
+
+          return JSON.parse(extracted);
+        } catch (finalErr) {
+          console.log("JSON parse error:", finalErr.message);
+          console.log("First 200 chars:", extracted.substring(0, 200));
+          return null;
+        }
+      }
     }
     return null;
   }
@@ -94,7 +127,10 @@ async function serperSearch(query, maxResults = 8) {
   } catch (err) {
     // show useful error
     const errMsg =
-      err?.response?.data?.error || err?.response?.data || err?.message || String(err);
+      err?.response?.data?.error ||
+      err?.response?.data ||
+      err?.message ||
+      String(err);
     console.log("Serper error:", errMsg);
     return [];
   }
@@ -128,7 +164,9 @@ function combineResearch(doc, snippets = []) {
     .slice(0, 24)
     .map(
       (s, i) =>
-        `${i + 1}. ${s.source.toUpperCase()} | ${s.title}\n${s.snippet}\n${s.url}`
+        `${i + 1}. ${s.source.toUpperCase()} | ${s.title}\n${s.snippet}\n${
+          s.url
+        }`
     )
     .join("\n\n");
 
@@ -136,8 +174,10 @@ function combineResearch(doc, snippets = []) {
 }
 
 /* ---------------- Groq LLM call ---------------- */
-async function callGroq(prompt) {
-  // We post to GROQ_API_URL (from env). This adapter expects openai-like chat completions
+/* ---------------- Groq LLM call with auto rate-limit retry ---------------- */
+async function callGroq(prompt, attempt = 1) {
+  const MAX_RETRIES = 3;
+
   try {
     const payload = {
       model: "llama-3.1-8b-instant",
@@ -157,95 +197,96 @@ async function callGroq(prompt) {
       timeout: 120000,
     });
 
-    // multiple providers have slightly different shapes; try common paths
-    const choices = res.data?.choices || res.data?.response?.choices || null;
-    if (choices && choices.length > 0) {
-      const msg = choices[0].message?.content ?? choices[0].text ?? null;
-      return msg;
+    const choices = res.data?.choices || res.data?.response?.choices;
+    if (choices?.length) {
+      return choices[0].message?.content ?? choices[0].text;
     }
 
-    // fallback: try data.text
-    if (res.data?.text) return res.data.text;
-
-    // if nothing found, return entire body as string
     return JSON.stringify(res.data);
+
   } catch (err) {
-    // bubble the full response for debugging
-    let msg = err?.response?.data || err?.message || String(err);
-    // try to stringify if object
+    const data = err?.response?.data;
+
+    // -------- Detect Groq rate limit --------
+    const message = data?.error?.message || "";
+
+    if (message.includes("Rate limit reached")) {
+      // Extract the number of seconds
+      const match = message.match(/try again in ([0-9.]+)s/i);
+      const waitSeconds = match ? parseFloat(match[1]) : 6;
+
+      console.log(
+        `⏳ Groq rate limit hit. Waiting ${waitSeconds}s before retrying (Attempt ${attempt}/${MAX_RETRIES})`
+      );
+
+      await new Promise((res) => setTimeout(res, waitSeconds * 1000));
+
+      if (attempt < MAX_RETRIES) {
+        return await callGroq(prompt, attempt + 1);
+      }
+
+      throw new Error("Groq rate limit exceeded even after retrying.");
+    }
+
+    // -------- Other errors --------
+    let msg = data || err.message || String(err);
     if (typeof msg === "object") msg = JSON.stringify(msg);
     throw new Error(`Groq failed: ${msg}`);
   }
 }
 
+
 /* ---------------- Build prompt ---------------- */
 function buildPrompt(doc, research) {
   return `
-You MUST follow all rules EXACTLY.
+You MUST return ONLY valid, properly formatted JSON. NO markdown formatting outside the JSON.
+All newline characters INSIDE the JSON strings must be written as the literal characters backslash-n (\\n), NOT actual line breaks.
+All quotes inside text must be escaped as \\".
+All backslashes must be escaped as \\\\.
 
----
-
-## RULES
-
-1. Think step-by-step **internally**, but output ONLY valid JSON.
-2. DO NOT write anything outside JSON. No preface, no explanation.
-3. Inside JSON:
-   - You may use simple Markdown (bold, italics, lists) BUT no headings.
-4. Use ONLY the research provided. Do NOT invent facts.
-5. Tone must be human, warm, and natural—not robotic.
-
----
-
-## CONTENT REQUIREMENTS
-
-### 1) "about"
-- 40–60 words
-- Very short, factual, crisp  
-- Summarize who the topper is and their approach  
-- No exaggeration, no generic sentences
-
-### 2) "strategy"
-- 450–650 words (long and SEO-rich)
-- Multi-paragraph  
-- High-detail explanation based ONLY on research  
-- Include:
-  - prelims approach  
-  - mains strategy  
-  - interview preparation  
-  - resources used  
-  - revision cycles  
-  - note-making style  
-  - optional subject approach  
-  - test series methods  
-- Should feel human-written, not AI-generated  
-- Should be tailored to THIS topper (no generic IAS advice)
-
-### 3) "insights"
-- 5–8 bullet points  
-- Short, specific, factual takeaways  
-
----
-
-## RESEARCH
+Use ONLY the research + structured data provided.
 
 ${research}
 
----
+Write 3 fields:
 
-## FINAL OUTPUT FORMAT (MANDATORY)
+1) "bio"
+   - 50–70 words
+   - simple, factual, research-based
+   - single paragraph
 
-Return ONLY this JSON object. NOTHING else.
+2) "strategy"
+   - 1200–1800 words (VERY LONG - 2-3x normal length)
+   - Written in HUMAN CONVERSATIONAL TONE - like a friend telling their story
+   - Use STORYTELLING format with narrative flow
+   - Divide into clear sections with ### headers
+   - Include personal anecdotes and experiences
+   - Use **bold** for key concepts and turning points
+   - Use \\n\\n for paragraph breaks (literal backslash-n backslash-n, not real newlines)
+   - Use - for key points with \\n between them
+   - Make it engaging, personal, and detailed
+   - Include: Background → Study Plan → Challenges → Strategies → Interview Experience → Success
+   - Sound natural and conversational, not robotic
+
+3) "insights"
+   - 6–10 short bullet-style sentences
+   - each 8–15 words
+   - actionable and practical
+
+Return EXACTLY this JSON structure, ensuring all newlines inside strings are represented as \\n:
 
 {
-  "about": "...",
-  "strategy": "...",
-  "insights": ["...", "..."]
+  "bio": "text...",
+  "strategy": "long story-format text with markdown...",
+  "insights": ["point1", "point2", "point3"]
 }
+
+DO NOT add any extra fields.
+DO NOT add any text outside the JSON.
+DO NOT add commentary.
+Return ONLY the raw JSON object. Nothing else.
 `;
 }
-
-
-
 
 /* ---------------- Process single topper ---------------- */
 async function processTopper(doc, coll) {
@@ -298,9 +339,13 @@ async function processTopper(doc, coll) {
   }
 
   // Try to parse JSON
+  console.log("Raw LLM response (first 500 chars):", raw.substring(0, 500));
   const parsed = safeJSON(raw);
   if (!parsed) {
-    console.log("❌ LLM returned invalid JSON. Raw output saved to `enrichedRaw`");
+    console.log(
+      "❌ LLM returned invalid JSON. Raw output saved to `enrichedRaw`"
+    );
+    console.log("Full raw output:", raw);
     await coll.updateOne(
       { _id: doc._id },
       {
@@ -315,12 +360,69 @@ async function processTopper(doc, coll) {
     return;
   }
 
-  // Validate fields
+  // Map "bio" from LLM (already has correct field name)
   const bio = parsed.bio ? String(parsed.bio).trim() : "";
   const strategy = parsed.strategy ? String(parsed.strategy).trim() : "";
   const insights = Array.isArray(parsed.insights)
-    ? parsed.insights.map((s) => String(s).trim()).filter(Boolean).slice(0, 6)
+    ? parsed.insights
+        .map((s) => String(s).trim())
+        .filter(Boolean)
+        .slice(0, 10)
     : [];
+
+  // Validate required fields
+  if (!bio || bio.length < 20) {
+    console.log(`⚠️ WARNING: bio is empty or too short for ${fullName(doc)}`);
+    console.log(`  bio length: ${bio.length}`);
+    await coll.updateOne(
+      { _id: doc._id },
+      {
+        $set: {
+          enriched: false,
+          enrichedError: "bio_too_short",
+          enrichedRaw: raw,
+          lastTriedAt: new Date(),
+        },
+      }
+    );
+    return;
+  }
+
+  if (!strategy || strategy.length < 150) {
+    console.log(
+      `⚠️ WARNING: strategy is empty or too short for ${fullName(doc)}`
+    );
+    console.log(`  strategy length: ${strategy.length}`);
+    await coll.updateOne(
+      { _id: doc._id },
+      {
+        $set: {
+          enriched: false,
+          enrichedError: "strategy_too_short",
+          enrichedRaw: raw,
+          lastTriedAt: new Date(),
+        },
+      }
+    );
+    return;
+  }
+
+  if (!insights || insights.length < 3) {
+    console.log(`⚠️ WARNING: insights too few for ${fullName(doc)}`);
+    console.log(`  insights count: ${insights.length}`);
+    await coll.updateOne(
+      { _id: doc._id },
+      {
+        $set: {
+          enriched: false,
+          enrichedError: "insufficient_insights",
+          enrichedRaw: raw,
+          lastTriedAt: new Date(),
+        },
+      }
+    );
+    return;
+  }
 
   // Update Mongo
   await coll.updateOne(
@@ -341,6 +443,9 @@ async function processTopper(doc, coll) {
   );
 
   console.log(`✔ Updated: ${fullName(doc)}`);
+  console.log(`  - bio: ${bio.length} chars`);
+  console.log(`  - strategy: ${strategy.length} chars`);
+  console.log(`  - insights: ${insights.length} points`);
 }
 
 /* ---------------- Main ---------------- */
